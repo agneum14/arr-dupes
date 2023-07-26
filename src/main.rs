@@ -1,8 +1,7 @@
 use std::collections::HashSet;
 use std::io::{stdin, stdout, Write};
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
-use std::str::FromStr;
+use std::path::Path;
 use std::{env, fs, vec};
 
 use transmission_rpc::types::{BasicAuth, Id, TorrentGetField};
@@ -30,12 +29,13 @@ impl TorrentData {
 }
 
 fn auth() -> TransClient {
-    let pass = env::var("TPASS").unwrap();
+    let pass = env::var("TPASS").expect("set TPASS environment variable");
     let basic_auth = BasicAuth {
         user: String::from(config::USER),
         password: String::from(pass),
     };
-    let client = TransClient::with_auth((&config::URL).parse().unwrap(), basic_auth);
+    let url = (&config::URL).parse().expect("can't parse URL");
+    let client = TransClient::with_auth(url, basic_auth);
 
     client
 }
@@ -44,13 +44,29 @@ fn add_media_inodes(inodes: &mut HashSet<u64>, media_dir: &String) {
     println!("adding inodes for {}", media_dir);
 
     for entry in WalkDir::new(media_dir) {
-        let entry = entry.unwrap();
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                println!("WARNING: can't get entry: {}", err);
+                continue;
+            }
+        };
 
         if !(entry.file_type().is_file()) {
             continue;
         }
 
-        let meta = fs::metadata(entry.path()).unwrap();
+        let meta = match fs::metadata(entry.path()) {
+            Ok(meta) => meta,
+            Err(err) => {
+                println!(
+                    "WARNING: can't get inode for file \"{}\": {}",
+                    entry.path().display(),
+                    err
+                );
+                continue;
+            }
+        };
         let inode = meta.ino();
         inodes.insert(inode);
     }
@@ -58,12 +74,11 @@ fn add_media_inodes(inodes: &mut HashSet<u64>, media_dir: &String) {
 
 async fn add_torrents(
     client: &mut TransClient,
-    torrents: &mut Vec<TorrentData>,
-    download_dir: &String,
+    torrent_data: &mut Vec<TorrentData>,
+    download_dirs: &Vec<String>,
 ) {
-    println!("fetching torrents with download_dir {}", download_dir);
+    println!("fetching torrents");
 
-    let path_start = PathBuf::from_str(download_dir).unwrap();
     let res = client
         .torrent_get(
             Some(vec![
@@ -78,29 +93,67 @@ async fn add_torrents(
             None,
         )
         .await
-        .unwrap();
+        .expect("can't connect to Transmission");
 
-    for torrent in res.arguments.torrents.into_iter().filter(|t| {
-        t.error_string.as_ref().unwrap() == ""
-            && t.download_dir.as_ref().unwrap() == download_dir
-            && t.seconds_seeding.as_ref().unwrap() >= &config::MIN_SEED_TIME
-    }) {
+    for t in res.arguments.torrents {
+        let err_str = t.error_string.unwrap_or("z".to_string());
+        let download_dir = t.download_dir.unwrap_or("".to_string());
+        let sec_seed = t
+            .seconds_seeding
+            .as_ref()
+            .unwrap_or(&(config::MIN_SEED_TIME + 1));
+
+        if !(err_str == ""
+            && download_dirs.contains(&download_dir)
+            && config::MIN_SEED_TIME >= *sec_seed)
+        {
+            continue;
+        }
+
         let mut inodes: Vec<u64> = Vec::new();
 
-        let name = torrent.name.as_ref().unwrap().to_owned();
-        let id = torrent.id.as_ref().unwrap().to_owned();
+        let name = t.name.unwrap_or("UNKNOWN".to_string());
+        let id = match t.id {
+            Some(id) => id,
+            None => {
+                println!(
+                    "WARNING: can't get ID for torrent \"{}\", omitting...",
+                    name
+                );
+                continue;
+            }
+        };
 
-        for file in torrent.files.unwrap() {
-            let path_end = PathBuf::from_str(&file.name).unwrap();
+        let path_start = Path::new(&download_dir);
+        let files = match t.files.as_ref() {
+            Some(files) => files,
+            None => {
+                println!("WARNING: no files for torrent \"{}\", omitting...", name);
+                continue;
+            }
+        };
+        for file in files {
+            let path_end = Path::new(&file.name);
             let path = path_start.join(path_end);
-            let meta = fs::metadata(path).unwrap();
+            let meta = match fs::metadata(&path) {
+                Ok(meta) => meta,
+                Err(err) => {
+                    println!(
+                        "WARNING: can't get inode for file \"{}\" for torrent \"{}\": {}, omitting...",
+                        path.display(),
+                        name,
+                        err
+                    );
+                    continue;
+                }
+            };
 
             if meta.is_file() {
                 inodes.push(meta.ino());
             }
         }
 
-        torrents.push(TorrentData { name, id, inodes });
+        torrent_data.push(TorrentData { name, id, inodes });
     }
 }
 
@@ -116,6 +169,7 @@ async fn remove_torrent(client: &mut TransClient, td: &TorrentData) {
 
 #[tokio::main]
 async fn main() {
+    let download_dirs = config::download_dirs();
     let mut media_inodes: HashSet<u64> = HashSet::new();
     let mut torrent_data: Vec<TorrentData> = Vec::new();
     let mut client = auth();
@@ -124,10 +178,7 @@ async fn main() {
         add_media_inodes(&mut media_inodes, &media_dir);
     }
 
-    for download_dir in config::download_dirs() {
-        add_torrents(&mut client, &mut torrent_data, &download_dir).await;
-    }
-
+    add_torrents(&mut client, &mut torrent_data, &download_dirs).await;
     torrent_data.retain(|td| td.unmatched(&media_inodes));
 
     if torrent_data.len() == 0 {
@@ -142,8 +193,8 @@ async fn main() {
     if config::CONFIRM {
         let mut input = String::new();
         print!("The above torrents have been marked for deletion. Continue? (Y/n): ");
-        stdout().flush().unwrap();
-        stdin().read_line(&mut input).unwrap();
+        stdout().flush().unwrap_or_else(|_| println!());
+        stdin().read_line(&mut input).expect("couln't read input");
         if input != "y\n" && input != "Y\n" && input != "\n" {
             return;
         }
