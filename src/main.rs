@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io::{stdin, stdout, Write};
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{env, fs, vec};
 
 use transmission_rpc::types::{BasicAuth, Id, TorrentGetField};
@@ -40,8 +40,8 @@ fn auth() -> TransClient {
     client
 }
 
-fn add_media_inodes(inodes: &mut HashSet<u64>, media_dir: &String) {
-    println!("adding inodes for {}", media_dir);
+fn add_media_inodes(inodes: &mut HashSet<u64>, media_dir: &PathBuf) {
+    println!("adding inodes for {}", media_dir.display());
 
     for entry in WalkDir::new(media_dir) {
         let entry = match entry {
@@ -75,7 +75,7 @@ fn add_media_inodes(inodes: &mut HashSet<u64>, media_dir: &String) {
 async fn add_torrents(
     client: &mut TransClient,
     torrent_data: &mut Vec<TorrentData>,
-    download_dirs: &Vec<String>,
+    download_dirs: &Vec<PathBuf>,
 ) {
     println!("fetching torrents");
 
@@ -98,6 +98,7 @@ async fn add_torrents(
     for t in res.arguments.torrents {
         let err_str = t.error_string.unwrap_or("z".to_string());
         let download_dir = t.download_dir.unwrap_or("".to_string());
+        let download_dir = PathBuf::from(&download_dir);
         let sec_seed = t
             .seconds_seeding
             .as_ref()
@@ -124,7 +125,6 @@ async fn add_torrents(
             }
         };
 
-        let path_start = Path::new(&download_dir);
         let files = match t.files.as_ref() {
             Some(files) => files,
             None => {
@@ -134,7 +134,7 @@ async fn add_torrents(
         };
         for file in files {
             let path_end = Path::new(&file.name);
-            let path = path_start.join(path_end);
+            let path = (&download_dir).join(path_end);
             let meta = match fs::metadata(&path) {
                 Ok(meta) => meta,
                 Err(err) => {
