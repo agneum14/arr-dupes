@@ -106,7 +106,7 @@ async fn add_torrents(
 
         if !(err_str == ""
             && download_dirs.contains(&download_dir)
-            && config::MIN_SEED_TIME >= *sec_seed)
+            && config::MIN_SEED_TIME < *sec_seed)
         {
             continue;
         }
@@ -192,8 +192,7 @@ async fn main() {
 
     if config::CONFIRM {
         let mut input = String::new();
-        print!("The above torrents have been marked for deletion. Continue? (Y/n): ");
-        stdout().flush().unwrap_or_else(|_| println!());
+        println!("The above torrents have been marked for deletion. Continue? (Y/n): ");
         stdin().read_line(&mut input).expect("couln't read input");
         if input != "y\n" && input != "Y\n" && input != "\n" {
             return;
